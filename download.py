@@ -3,6 +3,7 @@ import argparse
 from typing import NamedTuple
 import concurrent.futures as cf
 from contextlib import closing, ExitStack
+import json
 import os
 import shutil
 import signal
@@ -28,6 +29,7 @@ def parser(description):
     p.add_argument("--endpoint", default=os.getenv("HF_ENDPOINT") or OFFICIAL)
     p.add_argument("--workers", type=int, default=64, metavar="N")
     p.add_argument("--large-workers", type=int, metavar="N", help="initial largest-first slots")
+    p.add_argument("--reuse-mds-parts", action="store_true", help="resume partials from a matching legacy MDS snapshot")
     p.add_argument("--fixed-mix", action="store_true", help="keep the initial split throughout the run")
     p.add_argument("--window", type=int, default=300, metavar="SECONDS", help="stable measurement window")
     p.add_argument("--verify-only", action="store_true", help="verify all files using the saved manifest offline")
@@ -158,14 +160,18 @@ def transfer_queue(db, hub, revision, layout, args, files, total, baseline, chec
             raise
 
 
-def verify(db, layout, hub, files, check_drive):
+def verify(db, layout, hub, files, check_drive, repaired_only=False):
+    source = "files"
+    if repaired_only:
+        db.execute("CREATE TEMP TABLE repaired AS SELECT id FROM jobs")
+        source = "repaired JOIN files ON files.rowid=repaired.id"
+    entries = "SELECT files.rowid," + COLUMNS + " FROM " + source
     db.execute("DELETE FROM jobs")
     checked = bad_bytes = 0
     last = time.monotonic()
     failures = layout.path(STATE + "/verification-failures.jsonl")
-    import json
     with failures.open("w", encoding="utf-8") as log_file:
-        for checked, record in enumerate(db.execute("SELECT rowid," + COLUMNS + " FROM files"), 1):
+        for checked, record in enumerate(db.execute(entries), 1):
             key, row = record[0], record[1:]
             if not digest_ok(layout.path(row[1]), row, hub.stop):
                 db.execute("INSERT INTO jobs VALUES (?,?)", (key, row[2]))
@@ -195,9 +201,13 @@ def run(args):
     with ExitStack() as stack:
         # An older MDS-Bench process uses this lock in the same output folder.
         legacy = layout.path(".mds-state/run.lock")
-        if legacy.is_file():
+        if legacy.is_file() or args.reuse_mds_parts:
+            if not legacy.parent.is_dir():
+                raise ValueError("No legacy MDS state directory")
             stack.enter_context(single_run(legacy))
         stack.enter_context(single_run(layout.path(STATE + "/run.lock")))
+        if args.reuse_mds_parts and not args.verify_only:
+            layout.enable_mds_parts(hub.repo, args.revision)
         db = stack.enter_context(closing(sqlite3.connect(str(layout.path(STATE + "/manifest.sqlite")))))
         revision, files, total = manifest(db, hub, args.revision, args.verify_only)
         log("Snapshot %s @ %s | %d files | %.3f GB" % (hub.repo, revision, files, total/1e9))
@@ -214,7 +224,7 @@ def run(args):
         if bad and not args.verify_only:
             log("Repairing %d files" % bad)
             transfer(total - bad_bytes)
-            bad, _ = verify(db, layout, hub, files, check_drive)
+            bad, _ = verify(db, layout, hub, bad, check_drive, repaired_only=True)
         check_drive()
         write_report(layout, dict(repository=hub.repo, revision=revision, files=files, bytes=total,
                                   verified=files-bad, missing_or_corrupt=bad, complete=bad == 0,

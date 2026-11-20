@@ -179,6 +179,47 @@ class SnapshotTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             check_report(Layout(self.dest), "me/sample", "main", "unrelated-run")
 
+    def test_import_legacy_part_requires_same_snapshot_and_resumes_by_range(self):
+        import sqlite3
+        repo = "sdu-chenxin/MDS-Bench-data"
+        key = hashlib.sha256(b"data/test.bin").hexdigest()
+        old = self.dest / ".mds-state"
+        part = old / "parts" / key[:2] / key
+        part.parent.mkdir(parents=True)
+        part.write_bytes(FILES["data/test.bin"][:321])
+        (old / "run.lock").write_bytes(b"0")
+        db = sqlite3.connect(str(old / "manifest.sqlite"))
+        self.addCleanup(db.close)
+        db.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, val TEXT)")
+        db.executemany("INSERT INTO meta VALUES (?,?)", [("complete", "1"), ("revision", "b"*40)])
+        db.commit()
+        mismatch = self.cli("--revision", REV, "--reuse-mds-parts", repo=repo)
+        self.assertEqual(mismatch.returncode, 2)
+        self.assertEqual(self.server.resolves, [])
+        self.assertEqual(part.stat().st_size, 321)
+        db.execute("UPDATE meta SET val=? WHERE key='revision'", (REV,))
+        db.commit()
+        result = self.cli("--revision", REV, "--reuse-mds-parts", repo=repo)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(("data/test.bin", "bytes=321-"), self.server.resolves)
+        self.assertFalse(part.exists())
+        self.assertEqual((self.dest / "data/test.bin").read_bytes(), FILES["data/test.bin"])
+
+    def test_repair_rereads_only_files_that_failed_full_verification(self):
+        from unittest.mock import patch
+        import download
+        from storage import digest_ok
+        self.dest.mkdir()
+        (self.dest / "data").mkdir()
+        (self.dest / "notes.txt").write_bytes(b"broken")
+        (self.dest / "data/test.bin").write_bytes(FILES["data/test.bin"])
+        args = download.parse_args(["me/sample", str(self.dest), "--endpoint", self.endpoint])
+        with patch.object(download, "digest_ok", wraps=digest_ok) as reader:
+            download.run(args)
+        checked = [call.args[1][0] for call in reader.call_args_list]
+        self.assertEqual(checked.count("data/test.bin"), 1)
+        self.assertEqual(checked.count("notes.txt"), 2)
+
     def test_server_ignores_range_and_sends_full_file(self):
         part = self.seed_part()
         self.server.ignore_range = True

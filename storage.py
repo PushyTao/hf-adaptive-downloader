@@ -1,5 +1,5 @@
 """Pinned snapshot manifest, local file layout, and integrity checks."""
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import ctypes
 from functools import lru_cache
 import hashlib
@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import stat
 from urllib.parse import quote, urljoin, urlsplit
 
@@ -50,6 +51,7 @@ class Layout:
     def __init__(self, root):
         self.root = root
         self.state = root / STATE
+        self.legacy_keys = set()
         self.check_dir = lru_cache(maxsize=65536)(self._check_dir)
         reject_link(self.state)
 
@@ -66,7 +68,32 @@ class Layout:
 
     def part(self, remote):
         key = hashlib.sha256(remote.encode()).hexdigest()
-        return self.path(STATE + "/parts/" + key[:2] + "/" + key)
+        suffix = "/parts/" + key[:2] + "/" + key
+        native = self.path(STATE + suffix)
+        if key in self.legacy_keys and not native.exists():
+            return self.path(".mds-state" + suffix)
+        return native
+
+    def enable_mds_parts(self, repo, revision):
+        if repo != "sdu-chenxin/MDS-Bench-data" or not re.fullmatch("[a-f0-9]{40}", revision):
+            raise ValueError("--reuse-mds-parts requires the MDS-Bench dataset ID and its original full SHA")
+        manifest_path = self.path(".mds-state/manifest.sqlite")
+        if not manifest_path.is_file():
+            raise ValueError("No legacy MDS manifest at this destination")
+        with closing(sqlite3.connect(str(manifest_path))) as old:
+            old.execute("PRAGMA query_only=ON")
+            if meta(old, "revision") != revision or meta(old, "complete") != "1":
+                raise ValueError("Legacy manifest is incomplete or belongs to a different snapshot")
+        parts = self.path(".mds-state/parts")
+        if parts.is_dir():
+            for bucket in parts.iterdir():
+                if re.fullmatch("[0-9a-f]{2}", bucket.name):
+                    reject_link(bucket)
+                    for item in bucket.iterdir():
+                        if item.name.startswith(bucket.name) and re.fullmatch("[0-9a-f]{64}", item.name):
+                            reject_link(item)
+                            self.legacy_keys.add(item.name)
+        log("Found %d legacy MDS partials" % len(self.legacy_keys))
 
 
 @contextmanager
