@@ -58,7 +58,17 @@ class Hub(BaseHTTPRequestHandler):
             self.send_header(key, value)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        delay = getattr(self.server, "hold_first_body", None)
+        if delay and path.endswith("test.bin") and not self.headers.get("Range"):
+            self.wfile.write(body[:2*1024**2])
+            self.wfile.flush()
+            delay.wait(15)
+            try:
+                self.wfile.write(body[2*1024**2:])
+            except OSError:
+                pass
+        else:
+            self.wfile.write(body)
 
 
 class SnapshotTests(unittest.TestCase):
@@ -124,6 +134,50 @@ class SnapshotTests(unittest.TestCase):
             self.assertTrue(fetch(hub, REV, layout, row, traffic, yield_slot))
         self.assertEqual(self.server.resolves, [(row[0], None), (row[0], "bytes=1024-")])
         self.assertEqual(traffic.snapshot(), (len(data), len(data)))
+
+    def test_watchdog_restarts_killed_child_and_resumes_partial(self):
+        from unittest.mock import patch
+        import time
+        import watch
+        from download import parse_args
+
+        self.server.hold_first_body = threading.Event()
+        self.addCleanup(self.server.hold_first_body.set)
+        payload = b"a" * (4*1024**2)
+        key = hashlib.sha256(b"data/test.bin").hexdigest()
+        part = self.dest / ".hf-adaptive/parts" / key[:2] / key
+        argv = ["me/sample", str(self.dest), "--endpoint", self.endpoint]
+        children = []
+        real_launch = watch.launch
+
+        def launch_and_interrupt(command, run_id):
+            child = real_launch(command, run_id)
+            children.append(child)
+            if len(children) == 1:
+                until = time.monotonic() + 10
+                while time.monotonic() < until:
+                    if part.exists() and part.stat().st_size >= 1024**2:
+                        break
+                    time.sleep(.02)
+                child.kill()
+                child.wait()
+                self.server.hold_first_body.set()
+            return child
+
+        with patch.dict(FILES, {"data/test.bin": payload}), patch.object(watch, "launch", launch_and_interrupt):
+            self.assertEqual(watch.supervise(parse_args(argv), argv, 1), 0)
+        self.assertEqual(len(children), 2)
+        self.assertTrue(any(name.endswith(".bin") and r for name, r in self.server.resolves))
+        self.assertEqual((self.dest / "data/test.bin").read_bytes(), payload)
+
+    def test_watchdog_cli_checks_report(self):
+        result = self.cli("--workers", "2", script="watch.py")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Watchdog: verified", result.stdout)
+        from watch import check_report
+        from storage import Layout
+        with self.assertRaises(ValueError):
+            check_report(Layout(self.dest), "me/sample", "main", "unrelated-run")
 
     def test_server_ignores_range_and_sends_full_file(self):
         part = self.seed_part()

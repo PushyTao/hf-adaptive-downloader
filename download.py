@@ -5,6 +5,7 @@ import concurrent.futures as cf
 from contextlib import closing, ExitStack
 import os
 import shutil
+import signal
 import sqlite3
 import sys
 import threading
@@ -19,8 +20,8 @@ from transfer import fetch, Traffic
 from scheduler import AdaptiveMix, Pending, RecentSpeed
 
 
-def parser():
-    p = argparse.ArgumentParser(description=__doc__)
+def parser(description):
+    p = argparse.ArgumentParser(description=description)
     p.add_argument("repo", help="dataset ID, e.g. sdu-chenxin/MDS-Bench-data")
     p.add_argument("destination", help="local snapshot directory")
     p.add_argument("--revision", default="main", help="branch, tag, or full commit SHA")
@@ -33,8 +34,8 @@ def parser():
     return p
 
 
-def parse_args(argv=None):
-    p = parser()
+def parse_args(argv=None, description=__doc__):
+    p = parser(description)
     args = p.parse_args(argv)
     if not 1 <= args.workers <= 256:
         p.error("--workers must be in 1..256")
@@ -217,6 +218,7 @@ def run(args):
         check_drive()
         write_report(layout, dict(repository=hub.repo, revision=revision, files=files, bytes=total,
                                   verified=files-bad, missing_or_corrupt=bad, complete=bad == 0,
+                                  run_id=os.getenv("HF_ADAPTIVE_RUN_ID"),
                                   verified_at_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
         if bad:
             raise IncompleteDownload("See verification-failures.jsonl")
@@ -245,4 +247,6 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    if os.name == "nt":
+        signal.signal(signal.SIGBREAK, signal.default_int_handler)
     sys.exit(main())
