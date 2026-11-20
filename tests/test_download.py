@@ -48,6 +48,7 @@ class Hub(BaseHTTPRequestHandler):
                 headers["Content-Range"] = "bytes %d-%d/%d" % (start, len(body)-1, len(body))
                 body = body[start:]
                 status = 206
+            headers["Accept-Ranges"] = "bytes"
             headers["RateLimit-Policy"] = '"resolvers";q=5000;w=300'
         else:
             self.send_error(404)
@@ -103,6 +104,26 @@ class SnapshotTests(unittest.TestCase):
         wrong = self.cli(repo="other/data")
         self.assertEqual(wrong.returncode, 2)
         self.assertEqual(len(self.server.resolves), 2)
+
+    def test_yielded_transfer_resumes_without_counting_bytes_twice(self):
+        from unittest.mock import patch
+        from hub import Hub
+        from storage import Layout
+        from transfer import Traffic, fetch
+        data = FILES["data/test.bin"]
+        row = ("data/test.bin", "data/test.bin", len(data), "sha256", hashlib.sha256(data).hexdigest())
+        hub = Hub(self.endpoint, "me/sample", threading.Event())
+        layout = Layout(self.dest)
+        traffic = Traffic()
+        yield_slot = threading.Event()
+        yield_slot.set()
+        with patch("transfer.BLOCK", 1024):
+            self.assertFalse(fetch(hub, REV, layout, row, traffic, yield_slot))
+            self.assertFalse((self.dest / row[1]).exists())
+            yield_slot.clear()
+            self.assertTrue(fetch(hub, REV, layout, row, traffic, yield_slot))
+        self.assertEqual(self.server.resolves, [(row[0], None), (row[0], "bytes=1024-")])
+        self.assertEqual(traffic.snapshot(), (len(data), len(data)))
 
     def test_server_ignores_range_and_sends_full_file(self):
         part = self.seed_part()

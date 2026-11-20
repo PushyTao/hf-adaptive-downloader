@@ -26,7 +26,7 @@ class Traffic:
             return self.received, self.retained
 
 
-def fetch(hub, revision, layout, row, traffic):
+def fetch(hub, revision, layout, row, traffic, yield_slot):
     remote, name, size, _, _ = row
     part = layout.part(remote)
     dest = layout.path(name)
@@ -40,7 +40,7 @@ def fetch(hub, revision, layout, row, traffic):
         offset = file_size(part)
         if offset == size and digest_ok(part, row, hub.stop):
             os.replace(part, dest)
-            return
+            return True
         if offset >= 0 and (restart or offset >= size):
             part.unlink()
             traffic.record(0, -min(offset, size))
@@ -59,6 +59,7 @@ def fetch(hub, revision, layout, row, traffic):
                     end = int(span[2]) + 1
                 elif response.status_code != 200:
                     raise IncompleteDownload("unexpected resolver response")
+                resumable = append or response.headers.get("Accept-Ranges", "").lower() == "bytes"
                 written = offset if append else 0
                 with part.open("ab" if append and offset else "wb") as output:
                     if not append and offset:
@@ -70,11 +71,13 @@ def fetch(hub, revision, layout, row, traffic):
                             raise IncompleteDownload("oversized response")
                         output.write(block)
                         traffic.record(len(block), len(block))
+                        if resumable and written < size and yield_slot.is_set():
+                            return False
             if written == end and end < size:
                 continue
             if written == size and digest_ok(part, row, hub.stop):
                 os.replace(part, dest)
-                return
+                return True
             reason = "incomplete file or hash mismatch"
             restart = written == size
         except NETWORK_ERRORS as exc:

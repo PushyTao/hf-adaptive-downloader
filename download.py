@@ -1,6 +1,6 @@
 """Download and verify a pinned Hugging Face dataset snapshot."""
 import argparse
-from collections import deque
+from typing import NamedTuple
 import concurrent.futures as cf
 from contextlib import closing, ExitStack
 import os
@@ -16,6 +16,7 @@ from hub import Hub, IncompleteDownload, NETWORK_ERRORS, OFFICIAL, TemporaryHubE
 from storage import (allocation_unit, COLUMNS, destination, digest_ok, file_size, Layout,
                      manifest, single_run, STATE, write_report)
 from transfer import fetch, Traffic
+from scheduler import AdaptiveMix, Pending, RecentSpeed
 
 
 def parser():
@@ -26,6 +27,8 @@ def parser():
     p.add_argument("--endpoint", default=os.getenv("HF_ENDPOINT") or OFFICIAL)
     p.add_argument("--workers", type=int, default=64, metavar="N")
     p.add_argument("--large-workers", type=int, metavar="N", help="initial largest-first slots")
+    p.add_argument("--fixed-mix", action="store_true", help="keep the initial split throughout the run")
+    p.add_argument("--window", type=int, default=300, metavar="SECONDS", help="stable measurement window")
     p.add_argument("--verify-only", action="store_true", help="verify all files using the saved manifest offline")
     return p
 
@@ -39,6 +42,10 @@ def parse_args(argv=None):
         args.large_workers = max(1, args.workers // 4)
     if not 0 <= args.large_workers <= args.workers:
         p.error("--large-workers must be in 0..workers")
+    if args.window < 1:
+        p.error("--window must be positive")
+    if args.workers > 1 and not args.fixed_mix and not 0 < args.large_workers < args.workers:
+        p.error("adaptive scheduling requires both lanes; use --fixed-mix for a single lane")
     return args
 
 
@@ -67,39 +74,81 @@ def build_queue(db, layout, files, total):
     return total - needed + parts
 
 
+class Slot(NamedTuple):
+    rank: int
+    large: bool
+    size: int
+    yield_slot: threading.Event
+
+
 def transfer_queue(db, hub, revision, layout, args, files, total, baseline, check_drive):
-    queue = deque(key for key, in db.execute("SELECT id FROM jobs ORDER BY size,id"))
+    queue = Pending(key for key, in db.execute("SELECT id FROM jobs ORDER BY size,id"))
     if not queue:
         return
     traffic = Traffic()
     active = {}
     finished = files - len(queue)
-    started = last = time.monotonic()
+    small_finished = 0
+    mix = AdaptiveMix(args.workers, args.large_workers, args.window)
+    last = time.monotonic()
+    speed = RecentSpeed(last, 0, 0)
+    log("Workers %d | initial L/S %d/%d | %s | %s" %
+        (args.workers, mix.target, args.workers-mix.target,
+         "fixed" if args.fixed_mix else "adaptive %ds" % args.window, hub.pacer.status()))
     with cf.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        def submit(largest):
-            key = queue.pop() if largest else queue.popleft()
-            row = db.execute("SELECT " + COLUMNS + " FROM files WHERE rowid=?", (key,)).fetchone()
-            future = pool.submit(fetch, hub, revision, layout, row, traffic)
-            active[future] = (largest, row[2])
+        def fill():
+            large_count = sum(slot.large for slot in active.values())
+            while queue and len(active) < args.workers:
+                large = large_count < mix.target
+                rank, key = queue.take(large)
+                row = db.execute("SELECT " + COLUMNS + " FROM files WHERE rowid=?", (key,)).fetchone()
+                slot = Slot(rank, large, row[2], threading.Event())
+                future = pool.submit(fetch, hub, revision, layout, row, traffic, slot.yield_slot)
+                active[future] = slot
+                large_count += large
+            return large_count
 
         try:
-            for slot in range(min(args.workers, len(queue))):
-                submit(slot < args.large_workers)
+            large_count = fill()
             while active:
                 ready, _ = cf.wait(active, timeout=1, return_when=cf.FIRST_COMPLETED)
                 for future in ready:
-                    largest, size = active.pop(future)
-                    future.result()
-                    finished += 1
-                    if queue:
-                        submit(largest)
+                    slot = active.pop(future)
+                    if future.result():
+                        finished += 1
+                        small_finished += slot.size < 1024**2
+                    else:
+                        queue.put_back(slot.rank)
+                large_count = fill()
                 now = time.monotonic()
+                received, retained = traffic.snapshot()
+                old_target = mix.target
+                if not args.fixed_mix:
+                    decision = mix.update(now, retained, small_finished, hub.signals(), large_count,
+                                          len(active) == args.workers and bool(queue))
+                    if decision:
+                        log("Adaptive: %s | target L/S %d/%d" % (decision, mix.target, args.workers-mix.target))
+                if old_target != mix.target:
+                    # Release only surplus lanes. Ranged transfers yield after a persisted block.
+                    surplus_large = large_count > mix.target
+                    surplus = abs(large_count - mix.target)
+                    for slot in active.values():
+                        if slot.large == surplus_large and surplus:
+                            slot.yield_slot.set()
+                            surplus -= 1
+                        else:
+                            slot.yield_slot.clear()
                 if now - last >= 15 or not active:
                     check_drive()
-                    received, retained = traffic.snapshot()
-                    log("Download %d/%d files | %.3f/%.3f GB | %.2f MB/s received | %s" %
-                        (finished, files, (baseline+retained)/1e9, total/1e9,
-                         received/max(.001, now-started)/1e6, hub.pacer.status()))
+                    saved = min(total, max(0, baseline + retained))
+                    raw, useful, eta = speed.read(now, received, retained, remaining=total-saved)
+                    lhs = sum(slot.large for slot in active.values())
+                    avg = sum(slot.size for slot in active.values()) / max(1, len(active))
+                    log("Download %.2f%% | %d/%d files | %.3f/%.3f GB | %.2f MB/s received | "
+                        "%.2f MB/s useful | ETA %s | %s | active L/S %d/%d | target %d/%d | avg %.2f MiB" %
+                        (100*saved/max(1,total), finished, files, saved/1e9, total/1e9, raw/1e6, useful/1e6,
+                         "pending" if eta is None else "%.2f h" % (eta/3600), hub.pacer.status(),
+                         lhs, len(active)-lhs, mix.target, args.workers-mix.target, avg/(1024**2)))
                     last = now
         except BaseException:
             hub.stop.set()

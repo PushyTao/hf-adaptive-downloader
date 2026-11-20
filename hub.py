@@ -198,6 +198,10 @@ class Hub:
                 self.wait(2 ** attempt)
         raise TemporaryHubError("Network retries exhausted (%s)" % reason)
 
+    def signals(self):
+        with self.lock, self.pacer.lock:
+            return self.retries, self.pacer.throttles, self.pacer.policy
+
     def pause(self, seconds):
         with self.lock:
             self.pause_until = max(self.pause_until, time.monotonic() + seconds + 1)
